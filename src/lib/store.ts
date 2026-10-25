@@ -3,12 +3,20 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { openDatabase, databasePath } from "./db.ts";
 import {
+  analyticsFilter, accuracyTrend, commonMistakes, learningAnalytics, pendingReviews,
+  queryAttempts, recentAttempts, topicMetrics,
+} from "./analytics.ts";
+import {
+  gradeQuestion, gradingVersion, isAutomaticallyGraded, maxPointsFor, resolveGradingConfig,
+  retryLimitFor, type ErrorType, type GradingOutcome, type GradingStatus,
+} from "./grading/index.ts";
+import {
   id, courseInput, phaseInput, topicInput, lessonInput, questionInput, assessmentInput,
   reorderInput, saveAnswerInput, sectionInput, answerValue,
   type Course, type Phase, type Topic, type Lesson, type CourseStructure, type Question,
   type Assessment, type AttemptRow, type AnswerRow, type AttemptView, type AttemptResults,
   type AnswerValue, type SectionRow, type StudentQuestion, type StudentSection, type StudentLesson,
-  type ExerciseSubmission,
+  type ExerciseSubmission, type GradedAnswer, type GradingSummary,
 } from "./schemas.ts";
 
 export class AppError extends Error {
@@ -28,21 +36,38 @@ function validateAnswer(q: Question, value: AnswerValue) {
       throw new AppError("Answer must contain valid, unique option IDs");
   } else if (typeof value !== "string") throw new AppError("A text response is required");
 }
-/** Objective grading for choice questions; written types return null (instructor review). */
-function gradeAnswer(q: Question, value: AnswerValue): number | null {
-  if (!isChoice(q)) return null;
-  const selected = Array.isArray(value) ? value : [], correct = q.correctAnswer ?? [];
-  return selected.length === correct.length && correct.every((key) => selected.includes(key)) ? 1 : 0;
+/** Single entry point for every graded answer; never calls an AI model or the MCP instructor. */
+function grade(q: Question, value: AnswerValue): GradingOutcome {
+  return gradeQuestion(q, value);
 }
-const studentQuestion = ({ correctAnswer: _key, explanation: _explanation, ...q }: Question): StudentQuestion => q;
+/** Student-safe question: keys, explanations, and grading rules stay on the server. */
+const studentQuestion = (
+  { correctAnswer: _key, explanation: _explanation, grading: _grading, hint, ...q }: Question,
+  includeHint = true,
+): StudentQuestion => includeHint && hint !== undefined ? { ...q, hint } : q;
 const isEmpty = (v: AnswerValue) => v === null || (Array.isArray(v) ? !v.length : !v.trim());
 type SubmissionRow = {
   id: string; section_id: string; question_id: string; question_json: string; value_json: string;
   score: number | null; feedback: string; reviewed_at: string | null; created_at: string;
+  status: GradingStatus | null; awarded_points: number | null; max_points: number | null;
+  error_type: ErrorType | null; strategy: string | null; grading_version: string | null;
+  explanation: string | null; difficulty: string | null; topic_id: string | null;
+  attempt_number: number | null; duration_ms: number | null;
+  hint_used: number | null; hint_count: number | null;
 };
+/** Interprets a stored score the way legacy rows (written before grading configs) were interpreted. */
+const legacyStatus = (score: number | null): GradingStatus =>
+  score === null ? "needs_review" : score >= 1 ? "correct" : score > 0 ? "partially_correct" : "incorrect";
 const submissionView = (r: SubmissionRow): ExerciseSubmission => ({
   id: r.id, value: JSON.parse(r.value_json) as AnswerValue, score: r.score, feedback: r.feedback,
   reviewed_at: r.reviewed_at, created_at: r.created_at,
+  status: r.status ?? legacyStatus(r.score),
+  awardedPoints: r.awarded_points ?? r.score ?? 0,
+  maxPoints: r.max_points ?? 1,
+  errorType: (r.error_type ?? "unclassified") as ErrorType,
+  explanation: r.explanation ?? "",
+  strategy: (r.strategy ?? "manual") as ExerciseSubmission["strategy"],
+  gradingVersion: r.grading_version ?? "",
 });
 const submissionStatus = (score: number | null) =>
   score === null ? "pending_review" : score === 1 ? "correct" : score > 0 ? "partially_correct" : "incorrect";
@@ -268,14 +293,57 @@ export class Store {
     return { ...lesson, lastSectionId: position?.section_id ?? null,
       sections: this.sectionRows(lesson.id).map((row) => this.studentSection(row)) };
   }
+  private hintUsage(sectionId: string) {
+    return this.db.prepare("SELECT count, first_used_at FROM exercise_hint_usage WHERE section_id=?")
+      .get(sectionId) as { count: number; first_used_at: string } | undefined;
+  }
+  /** Describes grading, retries, and hint availability without revealing any answer key. */
+  private gradingSummary(q: Question, sectionId: string, submissions: SubmissionRow[]): GradingSummary {
+    const config = resolveGradingConfig(q);
+    const maxAttempts = retryLimitFor(q);
+    const failed = submissions.filter((s) => (s.status ?? legacyStatus(s.score)) !== "correct").length;
+    const hint = this.hintUsage(sectionId);
+    return {
+      strategy: config.strategy, automatic: isAutomaticallyGraded(q), maxPoints: config.points,
+      maxAttempts, attemptsUsed: submissions.length,
+      attemptsRemaining: maxAttempts === null ? null : Math.max(0, maxAttempts - submissions.length),
+      hintAvailable: Boolean(q.hint) && failed >= q.hintPolicy.afterFailedAttempts,
+      hintAfterFailedAttempts: q.hintPolicy.afterFailedAttempts,
+      hintUsed: Boolean(hint), hintCount: hint?.count ?? 0,
+    };
+  }
   private studentSection({ completed, archived: _archived, question_id, ...row }: SectionRow & { completed: number }): StudentSection {
     const submissions = question_id ? this.submissionRows(row.id) : [];
     const q = question_id ? this.getQuestion(question_id) : null;
+    const grading = q ? this.gradingSummary(q, row.id, submissions) : null;
+    const safe = q ? studentQuestion(q, grading!.hintAvailable) : null;
     return {
       ...row, completed: Boolean(completed), submissions: submissions.length,
       latest: submissions[0] ? submissionView(submissions[0]) : null,
-      question: q ? submissions.length ? q : studentQuestion(q) : null,
+      grading,
+      // Keys and explanations are revealed only once the student has submitted at least once.
+      question: safe && q ? submissions.length
+        ? { ...safe, correctAnswer: q.correctAnswer, explanation: q.explanation } : safe : null,
     };
+  }
+  /** Records that the student revealed a hint, so analytics never over-state unaided mastery. */
+  useHint(sectionId: string) {
+    const summary = this.db.transaction(() => {
+      const section = this.section(sectionId);
+      if (section.archived || !section.question_id) throw new AppError("This section has no active exercise");
+      const q = this.getQuestion(section.question_id);
+      if (!q.hint) throw new AppError("This exercise has no hint");
+      const submissions = this.submissionRows(section.id);
+      const failed = submissions.filter((s) => (s.status ?? legacyStatus(s.score)) !== "correct").length;
+      if (failed < q.hintPolicy.afterFailedAttempts)
+        throw new AppError(`The hint unlocks after ${q.hintPolicy.afterFailedAttempts} unsuccessful attempt(s)`);
+      const timestamp = now();
+      this.db.prepare(`INSERT INTO exercise_hint_usage VALUES (?, 1, ?, ?)
+        ON CONFLICT(section_id) DO UPDATE SET count=count+1, updated_at=excluded.updated_at`)
+        .run(section.id, timestamp, timestamp);
+      return { hint: q.hint, usage: this.gradingSummary(q, section.id, submissions) };
+    }).immediate();
+    return { sectionId, hint: summary.hint, grading: summary.usage };
   }
   private markSectionComplete(section: SectionRow) {
     const timestamp = now();
@@ -304,20 +372,40 @@ export class Store {
       .run(lessonId, sectionId, now());
     return { lessonId, sectionId };
   }
-  /** Saves a new exercise submission (retries allowed). Choice questions are auto-graded; written ones await review. */
-  submitExercise(sectionId: string, rawValue: unknown) {
+  /**
+   * Records a new exercise submission and grades it immediately and deterministically.
+   * Every attempt is preserved; earlier answers are never overwritten.
+   */
+  submitExercise(sectionId: string, rawValue: unknown, options?: unknown) {
     const value = answerValue.parse(rawValue);
+    const meta = z.object({ durationMs: z.number().int().min(0).max(86_400_000).nullable().default(null) })
+      .parse(options ?? {});
     const sectionKey = this.db.transaction(() => {
       const section = this.section(sectionId);
       if (section.archived || !section.question_id) throw new AppError("This section has no active exercise");
       if (isEmpty(value)) throw new AppError("Provide an answer before submitting");
       const q = this.getQuestion(section.question_id);
       validateAnswer(q, value);
-      const score = gradeAnswer(q, value), timestamp = now();
-      this.db.prepare(`INSERT INTO exercise_submissions (id, section_id, question_id, question_json, value_json, score, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`)
-        .run(randomUUID(), section.id, q.id, JSON.stringify(q), JSON.stringify(value), score, timestamp);
-      if (score === null || score === 1) this.markSectionComplete(section);
+      const previous = this.submissionRows(section.id);
+      const limit = retryLimitFor(q);
+      if (limit !== null && previous.length >= limit)
+        throw new AppError(limit === 1
+          ? "This exercise accepts a single attempt, which has already been used"
+          : `This exercise allows ${limit} attempts; all of them have been used`, 409);
+      const outcome = grade(q, value), timestamp = now();
+      const hint = this.hintUsage(section.id);
+      const topicId = this.getLesson(section.lesson_id).topic_id;
+      this.db.prepare(`INSERT INTO exercise_submissions
+        (id, section_id, question_id, question_json, value_json, score, created_at, status, awarded_points,
+         max_points, error_type, strategy, grading_version, explanation, difficulty, topic_id, question_type,
+         attempt_number, duration_ms, hint_used, hint_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(randomUUID(), section.id, q.id, JSON.stringify(q), JSON.stringify(value), outcome.score, timestamp,
+          outcome.status, outcome.awardedPoints, outcome.maxPoints, outcome.errorType, outcome.strategy,
+          outcome.gradingVersion, outcome.feedback, q.difficulty, topicId, q.type,
+          previous.length + 1, meta.durationMs, hint ? 1 : 0, hint?.count ?? 0);
+      // Correct answers and answers awaiting review complete the section; retries stay open otherwise.
+      if (outcome.status === "correct" || outcome.status === "needs_review") this.markSectionComplete(section);
       this.db.prepare(`INSERT INTO lesson_positions VALUES (?, ?, ?)
         ON CONFLICT(lesson_id) DO UPDATE SET section_id=excluded.section_id, updated_at=excluded.updated_at`)
         .run(section.lesson_id, section.id, timestamp);
@@ -346,11 +434,16 @@ export class Store {
        ORDER BY e.created_at DESC, e.rowid DESC LIMIT ?`,
       f.courseId ?? null, f.courseId ?? null, f.lessonId ?? null, f.lessonId ?? null,
       f.sectionId ?? null, f.sectionId ?? null, f.limit,
-    ).map((r) => ({
-      ...submissionView(r), status: submissionStatus(r.score), sectionId: r.section_id, sectionTitle: r.section_title,
-      sectionKind: r.section_kind, lessonId: r.lesson_id, lessonTitle: r.lesson_title, topicId: r.topic_id,
-      courseId: r.course_id, question: parseQuestions(`[${r.question_json}]`)[0],
-    }));
+    ).map((r) => {
+      const view = submissionView(r);
+      return {
+        ...view, status: submissionStatus(r.score), gradingStatus: view.status, sectionId: r.section_id,
+        sectionTitle: r.section_title, sectionKind: r.section_kind, lessonId: r.lesson_id,
+        lessonTitle: r.lesson_title, topicId: r.topic_id, courseId: r.course_id,
+        attemptNumber: r.attempt_number ?? 1, durationMs: r.duration_ms, hintUsed: Boolean(r.hint_used),
+        question: parseQuestions(`[${r.question_json}]`)[0],
+      };
+    });
   }
   gradeExerciseSubmission(input: unknown) {
     const g = z.object({
@@ -359,9 +452,10 @@ export class Store {
     const row = this.one<SubmissionRow>("SELECT * FROM exercise_submissions WHERE id=?", g.submissionId);
     if (isChoice(parseQuestions(`[${row.question_json}]`)[0]))
       throw new AppError("Choice exercises are graded automatically; only written submissions can be reviewed");
-    const timestamp = now();
-    this.db.prepare("UPDATE exercise_submissions SET score=?, feedback=?, reviewed_at=? WHERE id=?")
-      .run(g.score, g.feedback, timestamp, g.submissionId);
+    const timestamp = now(), maxPoints = row.max_points ?? 1;
+    this.db.prepare(`UPDATE exercise_submissions
+      SET score=?, feedback=?, reviewed_at=?, status=?, awarded_points=? WHERE id=?`)
+      .run(g.score, g.feedback, timestamp, legacyStatus(g.score), Math.round(g.score * maxPoints * 1000) / 1000, g.submissionId);
     return this.exerciseSubmissions({ sectionId: row.section_id, limit: 500 }).find((s) => s.id === g.submissionId)!;
   }
   upsertQuestion(input: unknown) {
@@ -456,7 +550,7 @@ export class Store {
     return {
       ...a, serverNow: now(),
       // Exams and practice assessments never include keys, explanations, or lesson hints before submission.
-      questions: parseQuestions(questions_json).map((q) => { const { hint: _hint, ...safe } = studentQuestion(q); return safe; }),
+      questions: parseQuestions(questions_json).map((q) => studentQuestion(q, false)),
       answers: Object.fromEntries(this.all<AnswerRow>(
         "SELECT * FROM student_answers WHERE attempt_id=?", attemptId,
       ).map((answer) => [answer.question_id, JSON.parse(answer.value_json) as AnswerValue])),
@@ -492,11 +586,19 @@ export class Store {
         "SELECT value_json FROM student_answers WHERE attempt_id=? AND question_id=?",
       ).get(attemptId, q.id) as { value_json: string } | undefined;
       const value: AnswerValue = existing ? JSON.parse(existing.value_json) : null;
-      const score = gradeAnswer(q, value);
+      const outcome = grade(q, value);
       this.db.prepare(`INSERT INTO student_answers
-        (attempt_id, question_id, value_json, score, updated_at) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(attempt_id, question_id) DO UPDATE SET score=excluded.score, updated_at=excluded.updated_at`)
-        .run(attemptId, q.id, JSON.stringify(value), score, timestamp);
+        (attempt_id, question_id, value_json, score, updated_at, status, awarded_points, max_points,
+         error_type, strategy, grading_version, explanation, difficulty, topic_id, question_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(attempt_id, question_id) DO UPDATE SET score=excluded.score, updated_at=excluded.updated_at,
+          status=excluded.status, awarded_points=excluded.awarded_points, max_points=excluded.max_points,
+          error_type=excluded.error_type, strategy=excluded.strategy, grading_version=excluded.grading_version,
+          explanation=excluded.explanation, difficulty=excluded.difficulty, topic_id=excluded.topic_id,
+          question_type=excluded.question_type`)
+        .run(attemptId, q.id, JSON.stringify(value), outcome.score, timestamp, outcome.status,
+          outcome.awardedPoints, outcome.maxPoints, outcome.errorType, outcome.strategy,
+          outcome.gradingVersion, outcome.feedback, q.difficulty, q.topicId, q.type);
     }
     this.db.prepare("UPDATE attempts SET submitted_at=? WHERE id=? AND submitted_at IS NULL")
       .run(timestamp, attemptId);
@@ -510,16 +612,34 @@ export class Store {
     const { questions_json, ...a } = this.attempt(attemptId);
     if (!a.submitted_at) throw new AppError("Results are available only after submission", 409);
     const questions = parseQuestions(questions_json);
-    const answers = this.all<AnswerRow>("SELECT * FROM student_answers WHERE attempt_id=?", attemptId)
-      .map(({ value_json, ...answer }) => ({ ...answer, value: JSON.parse(value_json) as AnswerValue }));
-    const earned = answers.reduce((sum, a) => sum + (a.score ?? 0), 0);
-    const pendingReview = answers.filter((a) => a.score === null).length;
+    const answers: GradedAnswer[] = this.all<AnswerRow>("SELECT * FROM student_answers WHERE attempt_id=?", attemptId)
+      .map(({ value_json, ...answer }) => {
+        const q = questions.find((q) => q.id === answer.question_id);
+        const maxPoints = answer.max_points ?? (q ? maxPointsFor(q) : 1);
+        return {
+          ...answer, value: JSON.parse(value_json) as AnswerValue,
+          result: {
+            status: answer.status ?? legacyStatus(answer.score),
+            awardedPoints: answer.awarded_points ?? (answer.score ?? 0) * maxPoints,
+            maxPoints, errorType: answer.error_type ?? "unclassified",
+            explanation: answer.explanation ?? "",
+          },
+        };
+      });
+    const earned = answers.reduce((sum, answer) => sum + answer.result.awardedPoints, 0);
+    const pending = answers.filter((answer) => answer.score === null);
+    const pendingReview = pending.length;
     const gradedCount = answers.length - pendingReview;
+    const total = answers.length
+      ? answers.reduce((sum, answer) => sum + answer.result.maxPoints, 0)
+      : questions.reduce((sum, q) => sum + maxPointsFor(q), 0);
+    const gradedTotal = answers.filter((answer) => answer.score !== null)
+      .reduce((sum, answer) => sum + answer.result.maxPoints, 0);
     return {
-      ...a, questions, answers, earned, total: questions.length,
-      percentage: pendingReview ? null : Math.round(earned / questions.length * 100),
-      pendingReview, gradedCount,
-      gradedPercentage: gradedCount ? Math.round(earned / gradedCount * 100) : null,
+      ...a, questions, answers, earned: Math.round(earned * 1000) / 1000, total,
+      percentage: pendingReview || !total ? null : Math.round(earned / total * 100),
+      pendingReview, gradedCount, provisional: pendingReview > 0,
+      gradedPercentage: gradedTotal ? Math.round(earned / gradedTotal * 100) : null,
       feedback: this.all<{ id: string; message: string; created_at: string }>(
         "SELECT id, message, created_at FROM instructor_feedback WHERE attempt_id=? ORDER BY created_at", attemptId,
       ),
@@ -539,9 +659,12 @@ export class Store {
       const q = result.questions.find((q) => q.id === g.questionId);
       if (!q || isChoice(q))
         throw new AppError("Only submitted written responses can be instructor-graded");
-      this.db.prepare(`UPDATE student_answers SET score=?, feedback=?, reviewed_at=?, updated_at=?
-        WHERE attempt_id=? AND question_id=?`)
-        .run(g.score, g.feedback, now(), now(), g.attemptId, g.questionId);
+      const maxPoints = result.answers.find((a) => a.question_id === g.questionId)?.result.maxPoints ?? maxPointsFor(q);
+      const timestamp = now();
+      this.db.prepare(`UPDATE student_answers SET score=?, feedback=?, reviewed_at=?, updated_at=?,
+          status=?, awarded_points=?, max_points=? WHERE attempt_id=? AND question_id=?`)
+        .run(g.score, g.feedback, timestamp, timestamp, legacyStatus(g.score),
+          Math.round(g.score * maxPoints * 1000) / 1000, maxPoints, g.attemptId, g.questionId);
     }).immediate();
     return this.results(g.attemptId);
   }
@@ -584,23 +707,23 @@ export class Store {
   topicPerformance(courseId: string) {
     this.expireAttempts();
     const topics = this.structure(courseId).phases.flatMap((p) => p.topics);
-    const scores = new Map<string, { earned: number; graded: number; pending: number }>();
+    const scores = new Map<string, { earned: number; graded: number; pending: number; possible: number }>();
     for (const a of this.all<AttemptRow>(
       "SELECT * FROM attempts WHERE course_id=? AND submitted_at IS NOT NULL", courseId,
     )) {
       const result = this.results(a.id);
       for (const q of result.questions) {
         const answer = result.answers.find((answer) => answer.question_id === q.id);
-        const s = scores.get(q.topicId) ?? { earned: 0, graded: 0, pending: 0 };
+        const s = scores.get(q.topicId) ?? { earned: 0, graded: 0, pending: 0, possible: 0 };
         if (answer?.score === null || answer?.score === undefined) s.pending++;
-        else { s.graded++; s.earned += answer.score; }
+        else { s.graded++; s.earned += answer.result.awardedPoints; s.possible += answer.result.maxPoints; }
         scores.set(q.topicId, s);
       }
     }
     return topics.map((t) => {
-      const s = scores.get(t.id) ?? { earned: 0, graded: 0, pending: 0 };
-      const percentage = s.graded ? Math.round(s.earned / s.graded * 100) : null;
-      return { topicId: t.id, title: t.title, priority: t.priority, ...s, percentage,
+      const { possible, ...s } = scores.get(t.id) ?? { earned: 0, graded: 0, pending: 0, possible: 0 };
+      const percentage = possible ? Math.round(s.earned / possible * 100) : null;
+      return { topicId: t.id, title: t.title, priority: t.priority, ...s, possiblePoints: possible, percentage,
         needsPractice: percentage !== null && percentage < 70 };
     });
   }
@@ -677,6 +800,42 @@ export class Store {
         "SELECT * FROM instructor_feedback WHERE course_id=? ORDER BY created_at DESC", courseId,
       ),
     };
+  }
+  /** Titles for every topic in the database, so analytics can label topic ids for humans and AI. */
+  private topicTitles() {
+    return new Map(this.all<{ id: string; title: string }>("SELECT id, title FROM topics")
+      .map((t) => [t.id, t.title] as const));
+  }
+  learningAnalytics(input: unknown) {
+    this.expireAttempts();
+    const filter = analyticsFilter.parse(input ?? {});
+    if (filter.courseId) this.getCourse(filter.courseId);
+    return learningAnalytics(this.db, filter, this.topicTitles());
+  }
+  topicAnalytics(input: unknown) {
+    this.expireAttempts();
+    const filter = analyticsFilter.parse(input ?? {});
+    if (!filter.topicId) throw new AppError("topicId is required");
+    const attempts = queryAttempts(this.db, filter);
+    const titles = this.topicTitles();
+    return {
+      ...topicMetrics(filter.topicId, attempts),
+      title: titles.get(filter.topicId) ?? null,
+      trend: accuracyTrend(attempts),
+      recent: recentAttempts(this.db, { ...filter, limit: Math.min(filter.limit, 20) }),
+    };
+  }
+  recentAttempts(input: unknown) {
+    this.expireAttempts();
+    return recentAttempts(this.db, input ?? {});
+  }
+  commonMistakes(input: unknown) {
+    this.expireAttempts();
+    return commonMistakes(this.db, input ?? {});
+  }
+  pendingReviews(input: unknown) {
+    this.expireAttempts();
+    return pendingReviews(this.db, input ?? {});
   }
 }
 

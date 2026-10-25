@@ -29,6 +29,8 @@ test("compiled STDIO server discovers read/write tools and works without Next.js
       "get_assessment_results", "get_student_answers", "get_topic_performance",
       "set_instructor_feedback", "grade_open_answer", "set_learning_priority", "recommend_next_topic",
       "get_lesson", "upsert_lesson_section", "get_exercise_submissions", "grade_exercise_submission",
+      "validate_grading_config", "get_learning_analytics", "get_topic_analytics", "get_recent_attempts",
+      "get_common_mistakes", "get_pending_reviews",
     ];
     assert.deepEqual(tools.map((t) => t.name).sort(), expected.sort());
     const created = await client.callTool({ name: "create_course", arguments: { title: "STDIO fixture" } });

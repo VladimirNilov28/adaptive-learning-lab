@@ -49,7 +49,7 @@ After submission, written answers show **Awaiting instructor review**, not an in
 
 ### Interactive lessons
 
-Lessons keep their Markdown `content` (shown as the overview) and may add ordered **sections**: `introduction`, `objectives`, `theory`, `example`, `exercise`, `explanation`, `knowledge_check`, `summary`, `note`. Exercise and knowledge-check sections embed a question that students answer in place, with an optional hint, starter code, retry, and feedback. Choice questions are graded automatically. Written answers (`short_text`, `code_text`, `predict_output`, `find_bug`) are stored for instructor review and are **never executed**. Answer keys and explanations are only sent after the student's first submission.
+Lessons keep their Markdown `content` (shown as the overview) and may add ordered **sections**: `introduction`, `objectives`, `theory`, `example`, `exercise`, `explanation`, `knowledge_check`, `summary`, `note`. Exercise and knowledge-check sections embed a question that students answer in place, with an optional hint, starter code, retry, and feedback. Choice questions are graded automatically, as is any question with a `grading` config — instantly, locally, and without an AI call. Written answers without one (`short_text`, `code_text`, `predict_output`, `find_bug`) are stored for instructor review. Student answers are **never executed**. Answer keys and explanations are only sent after the student's first submission.
 
 The lesson page has a course sidebar (a collapsible menu on mobile), a section outline, previous/next links, and section progress. Sections count as read when the student scrolls past them or clicks **Mark as read**. A lesson completes automatically once every section is done. The last viewed section is saved, so the dashboard's **Continue learning** card and the lesson's **Continue where you left off** link resume there.
 
@@ -111,7 +111,8 @@ All tools validate Zod inputs and return JSON text plus `structuredContent: { re
 | `create_course`, `update_course` | Create and edit course metadata |
 | `upsert_phase`, `upsert_topic`, `upsert_lesson` | Create or replace curriculum content |
 | `reorder_content` | Reorder all siblings under a parent |
-| `upsert_question` | Create/update questions and answer keys (optional `hint`, `starterCode`, `language`) |
+| `upsert_question` | Create/update questions and answer keys (optional `grading`, `retryPolicy`, `hintPolicy`, `tags`, `hint`, `starterCode`, `language`) |
+| `validate_grading_config` | Dry-run a grading config against sample answers before saving it |
 | `get_lesson` | Lesson with all sections, full questions, completion, submission counts, and the student's last position |
 | `upsert_lesson_section` | Create/update/archive a lesson section; exercises reference a `questionId` from the same course |
 | `get_exercise_submissions` | Exercise submissions filtered by course/lesson/section and status (`pending_review`, `incorrect`, `reviewed`) |
@@ -120,6 +121,8 @@ All tools validate Zod inputs and return JSON text plus `structuredContent: { re
 | `get_student_progress`, `get_assessment_results`, `get_student_answers`, `get_topic_performance` | Inspect progress, attempt IDs, answers, and topic performance |
 | `set_instructor_feedback`, `grade_open_answer` | Append feedback and grade submitted written answers |
 | `set_learning_priority`, `recommend_next_topic` | Adapt topic priority and recommend a topic/lesson |
+| `get_learning_analytics`, `get_topic_analytics` | Persistent per-attempt analytics: first-attempt vs eventual accuracy, mastery, difficulty breakdown, trends |
+| `get_recent_attempts`, `get_common_mistakes`, `get_pending_reviews` | Raw attempt history, repeated misconceptions, and everything awaiting review |
 
 Curriculum creation order: course → phase (`courseId`) → topic (`phaseId`) → lesson/question (`topicId`) → assessment (`courseId`, ordered `questionIds`). Use returned IDs for later calls. Positions are zero-based. Upserts omit `id` for creation; supply an existing `id` to replace fields. Omitted optional fields take their schema defaults, so send all fields you want to preserve. `update_course` is a partial update; `update_assessment` replaces the definition.
 
@@ -129,11 +132,17 @@ Question types:
 
 - `single_choice`: at least two `options: [{id, text}]`; `correctAnswer: ["option-id"]`.
 - `multiple_choice`: same options shape; `correctAnswer` contains all correct IDs. Exact-set grading, no partial automatic credit.
-- `short_text`, `code_text`, `predict_output`, `find_bug`: omit options and correctAnswer. Responses are stored for instructor review, never executed.
+- `short_text`, `code_text`, `predict_output`, `find_bug`, `numeric`: omit options and correctAnswer. Without a `grading` config they are stored for instructor review. Student input is **never executed**.
+
+### Deterministic grading
+
+Attach `grading` to a question and it is graded immediately by code, with no AI call. Strategies: `single_choice`, `multiple_choice` (optional `partialCredit`/`penalizeIncorrect`), `exact_match`, `normalized_match`, `accepted_answers`, `numeric` (absolute/relative tolerance), `output_match`, `regex_match` (patterns are rejected if they risk catastrophic backtracking), `bash_structure` (command/option/argument/pipeline/redirection assertions checked **statically by parsing the text**, never executed; constraints must be closed — `exactFlags`/`allowedFlags` plus ordered `positionalArguments` — so an extra option or a swapped argument is rejected, and anything the rules do not describe returns `needs_review` instead of a point), `rule` (sandboxed json-logic), and `manual`.
+
+Omitting `grading` preserves the original behaviour exactly, so existing questions are unaffected. `retryPolicy` (`unlimited`, `limited` with `maxAttempts`, or `none`) and `hintPolicy.afterFailedAttempts` control retries and when a hint unlocks. Every attempt, its error type, hint usage, and response time are recorded and surfaced through the analytics tools. Anything the engine cannot decide becomes **needs review** rather than wrong. See [`docs/grading-architecture.md`](docs/grading-architecture.md) for the full design, the libraries evaluated, and the security assumptions.
 
 Questions have `prompt`, `explanation`, and `difficulty` (`easy`, `medium`, `hard`). Prompts and lessons support Markdown with highlighted fenced code. Raw HTML is not rendered.
 
-Assessments use `mode: "practice" | "exam"`; exams require `durationMinutes` (1–1440). Practice may be untimed or timed. Each question is worth one point. `grade_open_answer` accepts `attemptId`, `questionId`, `score` (0–1, including partial credit), and required `feedback`. Results and MCP progress return `percentage: null` until every written answer is reviewed; `gradedCount`, `gradedPercentage`, and `earned` describe only completed grading. Topic performance uses graded answers across all submitted attempts; below 70% is a weak area. Unreviewed responses are not treated as topic failures.
+Assessments use `mode: "practice" | "exam"`; exams require `durationMinutes` (1–1440). Practice may be untimed or timed. Each question is worth one point unless its `grading.points` says otherwise. `grade_open_answer` accepts `attemptId`, `questionId`, `score` (0–1, including partial credit), and required `feedback`. Results and MCP progress return `percentage: null` until every written answer is reviewed; `gradedCount`, `gradedPercentage`, and `earned` describe only completed grading. Topic performance uses graded answers across all submitted attempts; below 70% is a weak area. Unreviewed responses are not treated as topic failures.
 
 `set_learning_priority` accepts `topicId` and `priority` (0–100, higher first). `recommend_next_topic` takes `courseId`, `topicId`, optional `lessonId`, and a student-visible `reason`; it overrides automatic recommendations until replaced. Otherwise recommendations prioritize unfinished topics by instructor priority, weak areas, then curriculum order.
 

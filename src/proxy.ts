@@ -1,8 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 
+const allowedHosts = new Set([
+  "localhost",
+  "127.0.0.1",
+  "[::1]",
+  "100.83.57.5"
+]);
+
 export function proxy(request: NextRequest) {
   const host = request.headers.get("host") ?? "";
-  if (!/^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/.test(host))
+  const hostname = host.replace(/:\d+$/, "");
+  if (!allowedHosts.has(hostname))
     return NextResponse.json({ error: "Only localhost requests are allowed" }, { status: 403 });
   if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) {
     const origin = request.headers.get("origin");

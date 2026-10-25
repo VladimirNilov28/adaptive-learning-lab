@@ -265,13 +265,13 @@ async function lessonBrowserFlow(courseId: string, topicId: string) {
     await card.getByText("Browser hint text").waitFor();
     await card.getByLabel("Choice X").check();
     await card.getByRole("button", { name: "Submit answer" }).click();
-    await card.getByText("Not quite — review and try again").waitFor();
+    await card.getByText(/Not quite · 0 \/ 1 point/).waitFor();
     assert.equal(await page.getByText("BROWSER_LESSON_EXPLANATION").count(), 0, "answer hidden until revealed");
     await card.getByRole("button", { name: "Reveal answer and explanation" }).click();
     await card.getByText("BROWSER_LESSON_EXPLANATION").waitFor();
     await card.getByLabel("Choice Z").check();
-    await card.getByRole("button", { name: "Submit again" }).click();
-    await card.getByText("Correct", { exact: true }).waitFor();
+    await card.getByRole("button", { name: "Try again" }).click();
+    await card.getByText(/^Correct · 1 \/ 1 point$/).waitFor();
     const command = page.getByLabel("Your answer");
     assert.equal(await command.inputValue(), "grep -r");
     await command.fill("grep -rn TODO .");
@@ -300,7 +300,7 @@ async function lessonBrowserFlow(courseId: string, topicId: string) {
 
 try {
   client = await connect();
-  assert.equal((await client.listTools()).tools.length, 25);
+  assert.equal((await client.listTools()).tools.length, 31);
   await startWeb();
   assert.match(await (await fetch(base)).text(), /There are no courses yet/);
   const course = await tool("create_course", { title: "MCP web smoke fixture", description: "Temporary integration fixture" }, entity);

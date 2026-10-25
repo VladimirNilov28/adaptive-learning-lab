@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+  CHOICE_STRATEGIES, gradingConfigInput, hintPolicyInput, retryPolicyInput,
+  type GradingConfig, type GradingStatus, type ErrorType, type GradingStrategy,
+} from "./grading/index.ts";
 
 export const id = z.string().trim().min(1).max(100);
 const title = z.string().trim().min(1).max(300);
@@ -33,7 +37,7 @@ export const lessonInput = z.object({
     "Assessment IDs must be unique").optional(),
 });
 export const questionType = z.enum([
-  "single_choice", "multiple_choice", "short_text", "code_text", "predict_output", "find_bug",
+  "single_choice", "multiple_choice", "short_text", "code_text", "predict_output", "find_bug", "numeric",
 ]);
 export const choiceTypes = new Set(["single_choice", "multiple_choice"]);
 export const questionInput = z.object({
@@ -48,6 +52,12 @@ export const questionInput = z.object({
   hint: text.optional(),
   starterCode: text.optional(),
   language: z.string().trim().max(40).regex(/^[\w+#.-]*$/, "Use a plain language name such as bash or python").optional(),
+  /** Deterministic grading rules. Omit to keep legacy behaviour (choice: exact set, written: review). */
+  grading: gradingConfigInput.optional(),
+  retryPolicy: retryPolicyInput,
+  hintPolicy: hintPolicyInput,
+  /** Free-form topic tags the AI instructor can use to group questions inside a topic. */
+  tags: z.array(z.string().trim().min(1).max(60)).max(20).default([]),
 }).superRefine((q, ctx) => {
   const choice = q.type === "single_choice" || q.type === "multiple_choice";
   const optionIds = new Set(q.options.map((o) => o.id));
@@ -61,7 +71,22 @@ export const questionInput = z.object({
     q.correctAnswer.some((answer) => !optionIds.has(answer))))
     ctx.addIssue({ code: "custom", message: "Correct answers must be unique option IDs" });
   if (!choice && (q.options.length || q.correctAnswer !== undefined))
-    ctx.addIssue({ code: "custom", message: "Written responses are reviewed by the instructor; omit options and correctAnswer" });
+    ctx.addIssue({ code: "custom", message: "Written responses use grading configuration instead of options and correctAnswer" });
+  if (q.grading) {
+    const isChoiceStrategy = CHOICE_STRATEGIES.includes(q.grading.strategy);
+    if (choice && !isChoiceStrategy && q.grading.strategy !== "manual")
+      ctx.addIssue({ code: "custom", message: `Choice questions support single_choice, multiple_choice or manual grading, not ${q.grading.strategy}` });
+    if (choice && isChoiceStrategy && q.grading.strategy !== q.type)
+      ctx.addIssue({ code: "custom", message: `A ${q.type} question requires ${q.type} grading` });
+    if (!choice && isChoiceStrategy)
+      ctx.addIssue({ code: "custom", message: `${q.grading.strategy} grading requires a choice question` });
+    if (q.type === "numeric" && !["numeric", "manual", "rule"].includes(q.grading.strategy))
+      ctx.addIssue({ code: "custom", message: "Numeric questions require numeric, rule or manual grading" });
+  }
+  if (q.hintPolicy.afterFailedAttempts > 0 && !q.hint)
+    ctx.addIssue({ code: "custom", message: "hintPolicy.afterFailedAttempts requires a hint" });
+  if (q.retryPolicy.mode === "none" && q.grading?.strategy === "manual")
+    ctx.addIssue({ code: "custom", message: "Manually reviewed questions cannot disable retries" });
 });
 export const assessmentInput = z.object({
   courseId: id,
@@ -104,21 +129,32 @@ export const answerValue = z.union([text, z.array(id).max(30), z.null()]);
 export const saveAnswerInput = z.object({ questionId: id, value: answerValue });
 export type Question = z.infer<typeof questionInput> & { id: string };
 export type AnswerValue = z.infer<typeof answerValue>;
-export type StudentQuestion = Omit<Question, "correctAnswer" | "explanation">;
+/** Never includes `grading`: accepted answers and rules are answer keys. */
+export type StudentQuestion = Omit<Question, "correctAnswer" | "explanation" | "grading" | "hint"> & { hint?: string };
 export type SectionKind = z.infer<typeof sectionKind>;
 export type SectionRow = {
   id: string; lesson_id: string; kind: SectionKind; title: string; content: string;
   question_id: string | null; position: number; archived: number; created_at: string; updated_at: string;
 };
+/** Student-safe description of how a question is graded, without revealing the rules themselves. */
+export type GradingSummary = {
+  strategy: GradingStrategy; automatic: boolean; maxPoints: number;
+  maxAttempts: number | null; attemptsUsed: number; attemptsRemaining: number | null;
+  hintAvailable: boolean; hintAfterFailedAttempts: number; hintUsed: boolean; hintCount: number;
+};
 export type ExerciseSubmission = {
   id: string; value: AnswerValue; score: number | null; feedback: string;
   reviewed_at: string | null; created_at: string;
+  status: GradingStatus; awardedPoints: number; maxPoints: number; errorType: ErrorType;
+  /** Deterministic engine feedback. Instructor review text stays in `feedback`. */
+  explanation: string; strategy: GradingStrategy; gradingVersion: string;
 };
 /** Student-safe section. `question` keys/explanations appear only after the student has submitted. */
 export type StudentSection = Omit<SectionRow, "archived" | "question_id"> & {
   completed: boolean;
   question: (StudentQuestion & { correctAnswer?: string[]; explanation?: string }) | null;
   submissions: number; latest: ExerciseSubmission | null;
+  grading: GradingSummary | null;
 };
 export type StudentLesson = Lesson & {
   sections: StudentSection[]; lastSectionId: string | null;
@@ -140,14 +176,25 @@ export type AttemptRow = {
 export type AnswerRow = {
   attempt_id: string; question_id: string; value_json: string;
   score: number | null; feedback: string; reviewed_at: string | null; updated_at: string;
+  status: GradingStatus | null; awarded_points: number | null; max_points: number | null;
+  error_type: ErrorType | null; strategy: GradingStrategy | null; grading_version: string | null;
+  explanation: string | null; topic_id: string | null; difficulty: string | null;
 };
 export type AttemptView = Omit<AttemptRow, "questions_json"> & {
   questions: StudentQuestion[]; answers: Record<string, AnswerValue>; serverNow: string;
 };
+export type GradedAnswer = Omit<AnswerRow, "value_json"> & {
+  value: AnswerValue;
+  /** Normalized view of the stored grading result, including legacy rows written before grading configs existed. */
+  result: { status: GradingStatus; awardedPoints: number; maxPoints: number; errorType: ErrorType; explanation: string };
+};
 export type AttemptResults = Omit<AttemptRow, "questions_json"> & {
   questions: Question[];
-  answers: (Omit<AnswerRow, "value_json"> & { value: AnswerValue })[];
+  answers: GradedAnswer[];
   earned: number; total: number; percentage: number | null; pendingReview: number;
   gradedCount: number; gradedPercentage: number | null;
+  /** True while any answer still awaits instructor review, so the score is provisional. */
+  provisional: boolean;
   feedback: { id: string; message: string; created_at: string }[];
 };
+export type { GradingConfig, GradingStatus, ErrorType, GradingStrategy };

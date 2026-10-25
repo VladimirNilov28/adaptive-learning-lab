@@ -21,7 +21,11 @@ const mutation = z.discriminatedUnion("action", [
   z.object({ action: z.literal("save_answer"), attemptId: id, ...saveAnswerInput.shape }),
   z.object({ action: z.literal("submit_attempt"), attemptId: id }),
   z.object({ action: z.literal("complete_section"), sectionId: id, completed: z.boolean() }),
-  z.object({ action: z.literal("submit_exercise"), sectionId: id, value: answerValue }),
+  z.object({
+    action: z.literal("submit_exercise"), sectionId: id, value: answerValue,
+    durationMs: z.number().int().min(0).max(86_400_000).nullable().default(null),
+  }),
+  z.object({ action: z.literal("use_hint"), sectionId: id }),
   z.object({ action: z.literal("set_position"), lessonId: id, sectionId: id.nullable() }),
 ]);
 
@@ -39,7 +43,9 @@ export async function POST(request: NextRequest) {
       case "save_answer": return NextResponse.json(store.saveAnswer(data.attemptId, data));
       case "submit_attempt": return NextResponse.json(store.submitAttempt(data.attemptId));
       case "complete_section": return NextResponse.json(store.completeSection(data.sectionId, data.completed));
-      case "submit_exercise": return NextResponse.json(store.submitExercise(data.sectionId, data.value));
+      case "submit_exercise":
+        return NextResponse.json(store.submitExercise(data.sectionId, data.value, { durationMs: data.durationMs }));
+      case "use_hint": return NextResponse.json(store.useHint(data.sectionId));
       case "set_position": return NextResponse.json(store.setPosition(data.lessonId, data.sectionId));
     }
   } catch (error) { return failure(error); }

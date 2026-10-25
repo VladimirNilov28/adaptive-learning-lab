@@ -12,6 +12,16 @@ const draftKey = (sectionId: string) => `exercise-draft:${sectionId}`;
 export const typeLabel: Record<string, string> = {
   single_choice: "Single choice", multiple_choice: "Multiple choice", short_text: "Short answer",
   code_text: "Code / command", predict_output: "Predict the output", find_bug: "Find the bug",
+  numeric: "Numeric answer",
+};
+/** Plain-language names for how an answer is checked. Shown so the student knows what to expect. */
+const strategyLabel: Record<string, string> = {
+  single_choice: "Checked automatically", multiple_choice: "Checked automatically",
+  exact_match: "Checked automatically (exact match)", normalized_match: "Checked automatically",
+  accepted_answers: "Checked automatically", numeric: "Checked automatically (numeric)",
+  output_match: "Checked automatically (output)", regex_match: "Checked automatically (pattern)",
+  bash_structure: "Checked automatically (command structure, never executed)",
+  rule: "Checked automatically (rule)", manual: "Reviewed by your instructor",
 };
 
 function display(value: AnswerValue, q: NonNullable<StudentSection["question"]>) {
@@ -27,7 +37,11 @@ export function ExerciseCard({ section, askContext }: { section: StudentSection;
   const q = view.question!, initial = (view.latest?.value ?? (choice(q.type) ? [] : q.starterCode ?? "")) as AnswerValue;
   const [value, setValue] = useState<AnswerValue>(initial);
   const [hint, setHint] = useState(false), [reveal, setReveal] = useState(false);
+  const [hintText, setHintText] = useState<string | null>(null);
   const [busy, setBusy] = useState(false), [error, setError] = useState(""), [restored, setRestored] = useState(false);
+  // Time on task is measured from the moment the exercise is first rendered, and reset after each attempt.
+  const started = useRef<number | null>(null);
+  useEffect(() => { started.current = performance.now(); }, [section.id]);
 
   useEffect(() => {
     try {
@@ -47,23 +61,38 @@ export function ExerciseCard({ section, askContext }: { section: StudentSection;
   async function submit() {
     setBusy(true); setError(""); setReveal(false);
     try {
-      const updated = await studentApi<StudentSection>({ action: "submit_exercise", sectionId: section.id, value });
-      setLocal(updated); setRestored(false);
+      const durationMs = started.current === null ? null : Math.min(86_400_000, Math.round(performance.now() - started.current));
+      const updated = await studentApi<StudentSection>({ action: "submit_exercise", sectionId: section.id, value, durationMs });
+      setLocal(updated); setRestored(false); started.current = performance.now();
       try { localStorage.removeItem(draftKey(section.id)); } catch { /* ignore */ }
       router.refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Could not submit your answer"); }
     finally { setBusy(false); }
   }
+  async function revealHint() {
+    setError("");
+    try {
+      const result = await studentApi<{ hint: string }>({ action: "use_hint", sectionId: section.id });
+      setHintText(result.hint); setHint(true); router.refresh();
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not load the hint"); }
+  }
 
   const selected = Array.isArray(value) ? value : [];
-  const latest = view.latest, written = !choice(q.type);
-  const status = !latest ? null : latest.score === null ? "pending" : latest.score === 1 ? "correct" :
-    latest.score > 0 ? "partial" : "incorrect";
+  const latest = view.latest, grading = view.grading, written = !choice(q.type);
+  const status = !latest ? null : latest.status === "needs_review" ? "pending" :
+    latest.status === "correct" ? "correct" : latest.status === "partially_correct" ? "partial" : "incorrect";
+  const reviewed = Boolean(latest?.reviewed_at);
+  const outOf = latest ? `${latest.awardedPoints} / ${latest.maxPoints} point${latest.maxPoints === 1 ? "" : "s"}` : "";
+  const exhausted = Boolean(grading && grading.attemptsRemaining === 0);
   const code = q.type !== "short_text";
   const inputId = `exercise-input-${section.id}`;
   return <div className={`exercise ${status ? `exercise-${status}` : ""}`}>
     <div className="exercise-head"><span className="exercise-label">{view.kind === "knowledge_check" ? "Knowledge check" : "Exercise"}</span>
-      <span className="badge">{typeLabel[q.type]}</span><span className="badge">{q.difficulty}</span>
+      <span className="badge">{typeLabel[q.type] ?? q.type}</span><span className="badge">{q.difficulty}</span>
+      {grading && <span className="badge">{grading.maxPoints} point{grading.maxPoints === 1 ? "" : "s"}</span>}
+      {grading && <span className="badge" title={grading.automatic
+        ? "Graded by code on this machine. No AI call, and your answer is never executed."
+        : "Your instructor reviews this answer."}>{strategyLabel[grading.strategy] ?? grading.strategy}</span>}
       {view.completed && <span className="badge correct">✓ Completed</span>}
       <AskInstructor context={{ ...askContext, exercisePrompt: q.prompt }} compact /></div>
     <Markdown>{q.prompt}</Markdown>
@@ -85,20 +114,29 @@ export function ExerciseCard({ section, askContext }: { section: StudentSection;
     </div>}
     {restored && <p className="muted small-text">Unsubmitted draft restored from this browser.</p>}
     <div className="exercise-actions">
-      <button className="button" disabled={busy} onClick={() => void submit()}>{busy ? "Submitting..." : latest ? "Submit again" : "Submit answer"}</button>
-      {q.hint && <button className="button secondary" aria-expanded={hint} onClick={() => setHint(!hint)}>{hint ? "Hide hint" : "Show hint"}</button>}
+      <button className="button" disabled={busy || exhausted} onClick={() => void submit()}>
+        {busy ? "Submitting..." : latest ? "Try again" : "Submit answer"}</button>
+      {(q.hint || grading?.hintAvailable) && <button className="button secondary" aria-expanded={hint}
+        onClick={() => (hint ? setHint(false) : void revealHint())}>
+        {hint ? "Hide hint" : "Show hint"}</button>}
+      {!q.hint && !grading?.hintAvailable && grading && grading.hintAfterFailedAttempts > 0 &&
+        <span className="muted small-text">A hint unlocks after {grading.hintAfterFailedAttempts} unsuccessful attempt(s).</span>}
       <button className="button ghost" disabled={busy} onClick={reset}>Reset answer</button>
-      {view.submissions > 0 && <span className="muted small-text">{view.submissions} attempt{view.submissions === 1 ? "" : "s"}</span>}
+      {view.submissions > 0 && <span className="muted small-text">{view.submissions} attempt{view.submissions === 1 ? "" : "s"}
+        {grading?.attemptsRemaining !== null && grading !== null && ` · ${grading.attemptsRemaining} remaining`}</span>}
+      {grading?.hintUsed && <span className="muted small-text">Hint used</span>}
     </div>
-    {hint && q.hint && <div className="callout callout-tip" data-callout="hint"><Markdown>{q.hint}</Markdown></div>}
+    {exhausted && <p className="muted small-text">You have used every attempt for this exercise. Your last answer is saved.</p>}
+    {hint && (hintText ?? q.hint) && <div className="callout callout-tip" data-callout="hint"><Markdown>{hintText ?? q.hint!}</Markdown></div>}
     {error && <p className="error" role="alert">{error}</p>}
     <div aria-live="polite">{latest && <div className={`exercise-feedback feedback-${status}`}>
-      <p className="feedback-title">{status === "correct" ? (written ? `Reviewed · ${latest.score} / 1` : "Correct") :
-        status === "pending" ? "Submitted · awaiting instructor review" :
-        status === "partial" ? `Reviewed · partially correct (${latest.score} / 1)` :
-        written ? `Reviewed · ${latest.score} / 1` : "Not quite — review and try again"}</p>
+      <p className="feedback-title">{status === "pending" ? "Submitted · awaiting instructor review" :
+        status === "correct" ? `Correct · ${outOf}` :
+        status === "partial" ? `Partially correct · ${outOf}` :
+        `Not quite · ${outOf}`}{reviewed && status !== "pending" ? " · reviewed by instructor" : ""}</p>
       {status === "pending" && <p className="muted small-text">Your answer is saved. Your instructor reviews written answers through MCP;
         feedback will appear here. You can keep going.</p>}
+      {latest.explanation && status !== "pending" && <p className="small-text">{latest.explanation}</p>}
       {written && <><p className="muted small-text">Last submitted answer</p><pre className="answer-text">{display(latest.value, q)}</pre></>}
       {latest.feedback && <><p className="muted small-text">Instructor feedback</p><div className="feedback"><Markdown>{latest.feedback}</Markdown></div></>}
       {status === "correct" ? q.explanation && <Markdown>{q.explanation}</Markdown> :

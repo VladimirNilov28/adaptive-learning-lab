@@ -3,6 +3,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { databasePath } from "./lib/db.ts";
 import { AppError, Store } from "./lib/store.ts";
+import { analyticsFilter } from "./lib/analytics.ts";
+import {
+  gradingConfigInput, gradeQuestion, gradingVersion, isAutomaticallyGraded, maxPointsFor,
+} from "./lib/grading/index.ts";
 import {
   id, courseInput, phaseInput, topicInput, lessonInput, questionInput, assessmentInput, reorderInput,
   sectionInput,
@@ -52,7 +56,7 @@ tool("upsert_lesson_section",
   "Create (omit id) or replace a section within a lesson. Kinds: introduction, objectives, theory, example, explanation, summary, note (Markdown content; GFM, fenced code with language tags, and > [!NOTE]/[!TIP]/[!WARNING] callouts) and exercise, knowledge_check (require questionId of a question in the same course; content is optional instructions shown above it). Position is zero-based. Set archived=true to hide a section while preserving student submissions. Sections cannot move between lessons.",
   sectionInput.innerType().shape, (args) => store.upsertSection(args));
 tool("upsert_question",
-  "Create or replace a question for assessments or lesson exercises. Choice questions require options with stable IDs and correctAnswer (option IDs). Written types (short_text, code_text, predict_output, find_bug) require instructor review; omit options and correctAnswer. Optional hint (shown on request in lessons, never during assessments), starterCode (prefilled editable text, e.g. buggy code for find_bug), and language (e.g. bash, python). Existing attempts and exercise submissions retain frozen question snapshots. Topic cannot change.",
+  "Create or replace a question for assessments or lesson exercises. Choice questions require options with stable IDs and correctAnswer (option IDs). Written types (short_text, code_text, predict_output, find_bug, numeric) are instructor-reviewed unless you attach a `grading` config, which makes them graded deterministically by code with no AI call. Strategies: single_choice, multiple_choice (partialCredit, penalizeIncorrect), exact_match (expected list, caseSensitive), normalized_match (expected list + normalization flags), accepted_answers (accepted list), numeric (expected, absoluteTolerance, relativeTolerance), output_match (accepted list, line-ending tolerant), regex_match (pattern rejected if it risks catastrophic backtracking; i/m/s/u flags only; fullMatch), bash_structure (command/option/argument/pipeline/redirection constraints checked STATICALLY by parsing the text — student code is NEVER executed). bash_structure constraints must be CLOSED, not just a list of required tokens: give `command` (or `pipeline`), `exactFlags` (the complete option set, [] for none) or `allowedFlags` (a whitelist), and `positionalArguments` (the complete ORDERED operand list, [] for none) or allowExtraArguments:true. Order matters: positionalArguments [\"ERROR\",\"app.log\"] rejects `grep -n app.log \"ERROR\"`, and exactFlags [\"-n\"] rejects `grep -nv`. Other options: flagAliases {\"-n\":[\"--line-number\"]} to accept long forms, flagsWithValues + requiredFlagValues for options such as `-m 5`, quotedArguments to require quoting, argumentOrder:\"any\", forbiddenFlags/forbiddenCommands/forbiddenArguments, requiredRedirections (allowExtraRedirections to relax), min/maxPipeSegments, and maxStatements (default 1, so `cmd; rm -rf /` is rejected). Use `alternatives` (a list of complete constraint sets) plus `acceptedAnswers` to accept several valid forms instead of writing a regex. Set completeness:\"open\" to allow partial constraints — anything they do not describe then returns needs_review rather than being marked correct. Unsupported shell constructs (variables, command substitution, loops) always return needs_review, rule (sandboxed json-logic expression over answer length/number/word/line facts), manual (instructor review). Optional retryPolicy (maxAttempts, revealAnswerAfter), hintPolicy (afterFailedAttempts, penaltyPoints), tags, hint, starterCode, and language. Use validate_grading_config to dry-run a config before saving. Existing attempts and exercise submissions retain frozen question snapshots. Topic cannot change.",
   questionInput.innerType().shape, (args) => store.upsertQuestion(args));
 tool("create_assessment", "Create an assessment using existing question IDs from any topics in the same course. Exams require durationMinutes. Every question is worth one point.",
   assessmentInput.innerType().shape, (args) => store.saveAssessment(args));
@@ -95,6 +99,52 @@ tool("set_learning_priority", "Set a topic's priority from 0 to 100; higher prio
 tool("recommend_next_topic", "Set an explicit next topic and optionally a specific lesson. This overrides automatic recommendations until replaced. Reason is shown to the student.",
   { courseId: id, topicId: id, lessonId: id.optional(), reason: z.string().trim().min(1).max(10_000) },
   (args) => store.recommend(args));
+
+const filterShape = analyticsFilter.shape;
+
+tool("validate_grading_config",
+  "Dry-run a grading configuration before saving it to a question. Validates the config (rejecting catastrophic regexes, unsafe json-logic, under-specified bash_structure constraints, and strategies that do not match the question type) and, when sampleAnswers are supplied, returns the exact deterministic outcome each answer would receive. On failure it returns valid:false with a field-by-field explanation instead of throwing. Always dry-run bash_structure configs with both correct AND deliberately wrong sample answers (an extra option, swapped arguments) to confirm the wrong ones are not accepted. Nothing is written to the database and no student code is executed.",
+  {
+    type: z.string().trim().min(1).max(40),
+    grading: z.unknown(),
+    options: z.array(z.object({ id, text: z.string() })).default([]),
+    correctAnswer: z.array(z.string()).optional(),
+    sampleAnswers: z.array(z.union([z.string(), z.array(z.string())])).max(50).default([]),
+  },
+  ({ type, grading, options, correctAnswer, sampleAnswers }) => {
+    const parsed = gradingConfigInput.safeParse(grading);
+    // Returned rather than thrown so the caller gets field-level guidance it can act on.
+    if (!parsed.success)
+      return {
+        valid: false,
+        errors: parsed.error.issues.map((issue) => ({ field: issue.path.join(".") || "(root)", problem: issue.message })),
+        hint: "Fix each field above and dry-run again. For bash_structure, constraints must be closed enough to disprove a wrong answer; set completeness:'open' to send undescribed answers to instructor review instead.",
+      };
+    const config = parsed.data;
+    const question = { id: "preview", type, options, correctAnswer, difficulty: "medium", grading: config };
+    return {
+      valid: true, strategy: config.strategy, config,
+      automaticallyGraded: isAutomaticallyGraded(question),
+      maxPoints: maxPointsFor(question),
+      gradingVersion: gradingVersion(question),
+      samples: sampleAnswers.map((value) => ({ answer: value, outcome: gradeQuestion(question, value) })),
+    };
+  });
+tool("get_learning_analytics",
+  "Persistent learning analytics computed from every recorded lesson-exercise retry and submitted assessment answer. Returns totals, first-attempt vs eventual accuracy, hint usage, per-topic mastery, difficulty breakdown, the most common error types with examples, and an accuracy trend. Every rate reports its sample size and flags low samples; attempts awaiting review are excluded from accuracy instead of being counted wrong. Filter by course, phase, topic, lesson, section, assessment, question, source, difficulty, question type, strategy, status, error type, and date range.",
+  filterShape, (args) => store.learningAnalytics(args));
+tool("get_topic_analytics",
+  "Deep analytics for one topic: mastery from the latest resolved attempt per question, first-attempt and eventual accuracy, average attempts to success, hint usage, average response time, difficulty breakdown, top error types, accuracy trend, and the most recent attempts.",
+  { ...filterShape, topicId: id }, (args) => store.topicAnalytics(args));
+tool("get_recent_attempts",
+  "Raw attempt-level history (newest first) across lesson exercises and submitted assessments, including the student's answer, grading status, error type, strategy, points, attempt number, hint usage, and response time. Use this to see what a student actually wrote before deciding what to teach next.",
+  filterShape, (args) => store.recentAttempts(args));
+tool("get_common_mistakes",
+  "Error-type histogram with concrete examples plus the questions the student missed more than once (and whether they eventually got them right). Use it to target explanations at real, repeated misconceptions.",
+  filterShape, (args) => store.commonMistakes(args));
+tool("get_pending_reviews",
+  "List attempts still awaiting instructor review (manual-strategy answers and engine-deferred cases), oldest first, with the student's answer and why it was deferred. Grade them with grade_exercise_submission or grade_open_answer.",
+  filterShape, (args) => store.pendingReviews(args));
 
 await server.connect(new StdioServerTransport());
 console.error(`Adaptive Learning Lab MCP ready. SQLite: ${databasePath()}`);

@@ -11,12 +11,17 @@ function display(value: AnswerValue, q: Question) {
   return Array.isArray(value) ? value.map((id) => q.options.find((o) => o.id === id)?.text ?? id).join("\n") : value;
 }
 const empty = (value: AnswerValue) => value === null || (Array.isArray(value) ? !value.length : !value.trim());
-function status(score: number | null, value: AnswerValue) {
-  if (empty(value)) return score === null ? { label: "Not answered · awaiting review", tone: "unanswered" } : { label: "Not answered", tone: "unanswered" };
-  if (score === null) return { label: "Pending review", tone: "pending" };
-  if (score === 1) return { label: "Correct", tone: "correct" };
-  if (score > 0) return { label: `Partially correct · ${score} / 1`, tone: "partial" };
-  return { label: "Incorrect", tone: "incorrect" };
+type Outcome = { status: string; awardedPoints: number; maxPoints: number };
+function status(result: Outcome, value: AnswerValue) {
+  const points = `${result.awardedPoints} / ${result.maxPoints}`;
+  if (empty(value))
+    return result.status === "needs_review"
+      ? { label: "Not answered · awaiting review", tone: "unanswered" }
+      : { label: "Not answered", tone: "unanswered" };
+  if (result.status === "needs_review") return { label: "Pending review", tone: "pending" };
+  if (result.status === "correct") return { label: `Correct · ${points}`, tone: "correct" };
+  if (result.status === "partially_correct") return { label: `Partially correct · ${points}`, tone: "partial" };
+  return { label: `Incorrect · ${points}`, tone: "incorrect" };
 }
 export default async function ResultsPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params, store = getStore();
@@ -32,7 +37,7 @@ export default async function ResultsPage({ params }: { params: Promise<{ id: st
     <div className="page-heading"><p className="eyebrow">Assessment results</p><h1>{result.title}</h1></div>
     <section className="panel">{result.pendingReview ? <>
       <h2>Awaiting instructor review</h2><p>{result.pendingReview} written response(s) pending. Your submission is saved; no final score is available yet.</p>
-      {result.gradedCount > 0 && <p className="muted">Graded so far: {result.earned} / {result.gradedCount} points ({result.gradedPercentage}%).
+      {result.gradedCount > 0 && <p className="muted">Graded so far: {result.earned} points ({result.gradedPercentage}%).
         Ungraded responses are not counted as incorrect.</p>}
       <p className="muted">Your instructor can review these answers through MCP. Return here to view feedback; this page updates automatically.</p>
     </> : <><p className="eyebrow">Final score</p><div className="score">{result.percentage}<span>%</span></div>
@@ -40,7 +45,7 @@ export default async function ResultsPage({ params }: { params: Promise<{ id: st
       <a href="#answer-review">View feedback & answer review →</a></>}
       <div className="status-summary">{Object.entries(result.questions.reduce<Record<string, number>>((counts, q) => {
         const answer = result.answers.find((a) => a.question_id === q.id);
-        const s = status(answer?.score ?? null, answer?.value ?? null);
+        const s = status(answer?.result ?? { status: "needs_review", awardedPoints: 0, maxPoints: 1 }, answer?.value ?? null);
         counts[s.tone] = (counts[s.tone] ?? 0) + 1; return counts;
       }, {})).map(([tone, n]) => <span key={tone} className={`badge ${tone}`}>{n} {{ correct: "correct", incorrect: "incorrect",
         partial: "partially correct", pending: "pending review", unanswered: "not answered" }[tone]}</span>)}</div>
@@ -49,10 +54,11 @@ export default async function ResultsPage({ params }: { params: Promise<{ id: st
     {result.feedback.length > 0 && <section className="panel"><h2>Instructor feedback</h2>
       {result.feedback.map((f) => <p className="feedback" key={f.id}>{f.message}</p>)}</section>}
     <div id="answer-review">{result.questions.map((q, i) => {
-      const answer = result.answers.find((a) => a.question_id === q.id)!, s = status(answer.score, answer.value);
+      const answer = result.answers.find((a) => a.question_id === q.id)!, s = status(answer.result, answer.value);
       return <section className="panel" key={q.id}><div className="row"><p className="eyebrow">Question {i + 1}</p>
-        <span className={`badge ${s.tone}`}>{s.label}{answer.score !== null && s.tone !== "partial" ? ` · ${answer.score} / 1` : ""}</span></div>
+        <span className={`badge ${s.tone}`}>{s.label}</span></div>
         <Markdown>{q.prompt}</Markdown>
+        {answer.result.explanation && <p className="muted small-text">{answer.result.explanation}</p>}
         <h3>Your answer</h3><pre className="answer-text">{display(answer.value, q)}</pre>
         {q.correctAnswer && <><h3>Correct answer</h3><pre className="answer-text">{display(q.correctAnswer, q)}</pre></>}
         {q.explanation && <><h3>Explanation</h3><Markdown>{q.explanation}</Markdown></>}
